@@ -90,8 +90,21 @@ class GptOssExperts(nn.Module):
             torch.Tensor
         """
         batch_size = hidden_states.shape[0]
+        seq_len = hidden_states.shape[1]  # Store seq_len for later reshape
         hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
-        if hidden_states.device.type == "cpu" or self.training:
+        # Check is_tracing first to avoid Proxy comparison in control flow
+        # Support both torch.export (which uses torch._dynamo) and FX tracing
+        is_tracing = False
+        # Check torch._dynamo FIRST (for torch.export) to avoid scoping issues
+        try:
+            import torch._dynamo
+            is_tracing = torch._dynamo.is_compiling()
+        except (ImportError, AttributeError):
+            pass
+        # If not dynamo, check FX tracing
+        if not is_tracing:
+            is_tracing = torch.fx._symbolic_trace.is_fx_tracing()
+        if not is_tracing and (hidden_states.device.type == "cpu" or self.training):
             next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
             with torch.no_grad():
                 expert_mask = torch.nn.functional.one_hot(
@@ -122,7 +135,7 @@ class GptOssExperts(nn.Module):
             next_states = next_states.view(batch_size, -1, self.hidden_size)
         else:
             num_tokens = hidden_states.shape[0]
-            hidden_states = hidden_states.repeat(self.num_experts, 1)
+            hidden_states = hidden_states.repeat(self.num_experts, 1).contiguous()
             hidden_states = hidden_states.view(self.num_experts, -1, self.hidden_size)
             gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]
             gate, up = gate_up[..., ::2], gate_up[..., 1::2]
@@ -131,13 +144,13 @@ class GptOssExperts(nn.Module):
             glu = gate * torch.sigmoid(gate * self.alpha)
             next_states = torch.bmm(((up + 1) * glu), self.down_proj)
             next_states = next_states + self.down_proj_bias[..., None, :]
-            next_states = next_states.view(self.num_experts, batch_size, -1, self.hidden_size)
+            # Use stored batch_size and seq_len for dynamic shapes in torch.export
+            next_states = next_states.view(self.num_experts, batch_size, seq_len, self.hidden_size)
 
-            full_routing_weights = torch.zeros(
-                num_tokens, self.num_experts, device=routing_weights.device, dtype=routing_weights.dtype
-            )
-            full_routing_weights.scatter_(1, router_indices, routing_weights)
-            full_routing_weights = full_routing_weights.transpose(0, 1).view(self.num_experts, batch_size, -1, 1)
+            full_routing_weights = routing_weights.new_zeros(num_tokens, self.num_experts)
+            full_routing_weights = full_routing_weights.scatter(1, router_indices, routing_weights)
+            # Use stored batch_size and seq_len for dynamic shapes in torch.export
+            full_routing_weights = full_routing_weights.transpose(0, 1).view(self.num_experts, batch_size, seq_len, 1)
 
             next_states = next_states * full_routing_weights
             next_states = next_states.sum(dim=0)
@@ -179,7 +192,8 @@ class GptOssRotaryEmbedding(Qwen2RotaryEmbedding):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        # Avoid expand() for FX tracing compatibility - use broadcasting instead
+        inv_freq_expanded = self.inv_freq[None, :, None].float().to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
@@ -270,7 +284,8 @@ class GptOssAttention(Qwen2Attention):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        # Avoid tuple unpacking for FX tracing compatibility
+        hidden_shape = input_shape + (-1, self.head_dim)
 
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -300,7 +315,8 @@ class GptOssAttention(Qwen2Attention):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        # Avoid tuple unpacking for FX tracing compatibility
+        attn_output = attn_output.reshape(input_shape + (-1,)).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 

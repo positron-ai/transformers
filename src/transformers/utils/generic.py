@@ -850,22 +850,40 @@ def check_model_inputs(func=None, *, tie_last_hidden_states=True):
     def wrapped_fn(func):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
-            use_cache_arg_index = None
-            if "use_cache" in func.__code__.co_varnames:
-                use_cache_arg_index = func.__code__.co_varnames.index("use_cache") - 1  # -1 for self
+            # Ensure kwargs is always a dict (FX with concrete_args passes None)
+            if kwargs is None:
+                kwargs = {}
 
-            if (
-                use_cache_arg_index is not None
-                and len(args) > use_cache_arg_index
-                and args[use_cache_arg_index] is not None
-            ):
-                use_cache = args[use_cache_arg_index]
-            elif kwargs.get("use_cache") is not None:
-                use_cache = kwargs["use_cache"]
+            # Check if we're in FX tracing mode
+            is_tracing = False
+            if _is_torch_available:
+                try:
+                    import torch.fx
+                    is_tracing = torch.fx._symbolic_trace.is_fx_tracing()
+                except (ImportError, AttributeError):
+                    pass
+
+            if not is_tracing:  # Only manipulate use_cache when NOT tracing
+                use_cache_arg_index = None
+                if "use_cache" in func.__code__.co_varnames:
+                    use_cache_arg_index = func.__code__.co_varnames.index("use_cache") - 1  # -1 for self
+
+                if (
+                    use_cache_arg_index is not None
+                    and len(args) > use_cache_arg_index
+                    and args[use_cache_arg_index] is not None
+                ):
+                    use_cache = args[use_cache_arg_index]
+                elif kwargs.get("use_cache") is not None:
+                    use_cache = kwargs["use_cache"]
+                else:
+                    use_cache = getattr(self.config, "use_cache", None)
             else:
-                use_cache = getattr(self.config, "use_cache", None)
+                # During FX tracing, use default behavior without accessing Proxy args
+                use_cache = (kwargs.get("use_cache") if kwargs else None) or getattr(self.config, "use_cache", None)
 
-            if use_cache is not None:
+            # During tracing, skip use_cache handling entirely to avoid modifying Proxy objects
+            if not is_tracing and use_cache is not None:
                 if getattr(self, "gradient_checkpointing", False) and self.training and use_cache:
                     logger.warning_once(
                         "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
@@ -883,8 +901,9 @@ def check_model_inputs(func=None, *, tie_last_hidden_states=True):
             if return_dict is None:
                 return_dict = getattr(self.config, "return_dict", True)
 
-            all_args = kwargs.copy()
-            if "kwargs" in all_args:
+            all_args = kwargs.copy() if not is_tracing else {}
+            # During tracing, skip kwargs flattening to avoid iterating over Proxy objects
+            if not is_tracing and "kwargs" in all_args:
                 for k, v in all_args["kwargs"].items():
                     all_args[k] = v
 
@@ -956,7 +975,8 @@ def check_model_inputs(func=None, *, tie_last_hidden_states=True):
                             monkey_patched_layers.append((module, original_forward))
 
             try:
-                if kwargs.get("debug_io", False):
+                # During tracing, skip debug_io check to avoid control flow with Proxy objects
+                if not is_tracing and kwargs.get("debug_io", False):
                     with model_addition_debugger_context(
                         self, kwargs.get("debug_io_dir", "model_debug"), kwargs.get("prune_layers")
                     ):
